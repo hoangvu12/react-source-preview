@@ -1,53 +1,34 @@
 /**
  * Preview site for React Source Extractor.
  *
- * Receives code via:
- *   1. postMessage from parent iframe embedder (primary)
- *   2. URL hash (fallback) — base64-encoded JSON { code, css?, tailwind? }
+ * Receives JSX code via postMessage or URL hash, compiles it with Sucrase
+ * (loaded from CDN), resolves npm imports via esm.sh, and renders the component.
  *
- * Uses esbuild-wasm to bundle user code + npm dependencies in-browser.
- * npm packages are fetched from cdn.jsdelivr.net.
- * React/ReactDOM are pre-bundled and provided as externals.
+ * No bundler needed — uses native ES module imports via blob URLs.
  */
-
-import * as esbuild from 'esbuild-wasm/esm/browser.js';
-import React from 'react';
-import * as jsxRuntime from 'react/jsx-runtime';
-import * as jsxDevRuntime from 'react/jsx-dev-runtime';
-import ReactDOM from 'react-dom/client';
 
 const rootEl = document.getElementById('root')!;
 const errorEl = document.getElementById('error')!;
 const loadingEl = document.getElementById('loading')!;
 
-let currentRoot: ReactDOM.Root | null = null;
 let tailwindLoaded = false;
 let pendingTailwind: Promise<void> | null = null;
-let esbuildReady = false;
-let esbuildInitPromise: Promise<void> | null = null;
+let sucraseTransform: ((code: string, options: any) => { code: string }) | null = null;
+let sucraseLoading: Promise<void> | null = null;
+let currentCleanup: (() => void) | null = null;
 
-// ── Globals for the runtime require() ──────────────────────────────────
-const EXTERNAL_MODULES: Record<string, any> = {
-  'react': React,
-  'react-dom': ReactDOM,
-  'react-dom/client': ReactDOM,
-  'react/jsx-runtime': jsxRuntime,
-  'react/jsx-dev-runtime': jsxDevRuntime,
-};
+// ── Load Sucrase from CDN ──────────────────────────────────────────────
+async function ensureSucrase(): Promise<void> {
+  if (sucraseTransform) return;
+  if (sucraseLoading) return sucraseLoading;
 
-// ── esbuild init ───────────────────────────────────────────────────────
-async function ensureEsbuild(): Promise<void> {
-  if (esbuildReady) return;
-  if (esbuildInitPromise) return esbuildInitPromise;
+  sucraseLoading = (async () => {
+    const mod = await import('https://esm.sh/sucrase@3.35.1');
+    sucraseTransform = mod.transform;
+    console.log('[preview] Sucrase loaded');
+  })();
 
-  esbuildInitPromise = esbuild.initialize({
-    wasmURL: 'https://cdn.jsdelivr.net/npm/esbuild-wasm@0.27.3/esbuild.wasm',
-  }).then(() => {
-    esbuildReady = true;
-    console.log('[preview] esbuild-wasm initialized');
-  });
-
-  return esbuildInitPromise;
+  return sucraseLoading;
 }
 
 // ── Tailwind CDN ───────────────────────────────────────────────────────
@@ -97,26 +78,22 @@ function showLoading(msg: string) {
 
 function hideLoading() { loadingEl.style.display = 'none'; }
 
-// ── CDN fetch cache ────────────────────────────────────────────────────
-const fetchCache = new Map<string, string>();
+// ── Import rewriting ───────────────────────────────────────────────────
 
-async function fetchText(url: string): Promise<string> {
-  if (fetchCache.has(url)) return fetchCache.get(url)!;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${url}`);
-  const text = await res.text();
-  fetchCache.set(url, text);
-  return text;
+/** Extract bare import specifiers from code */
+function extractImports(code: string): string[] {
+  const imports = new Set<string>();
+  // Match: import ... from 'pkg' / import 'pkg' / export ... from 'pkg'
+  const re = /(?:import|export)\s+.*?from\s+['"]([^'"./][^'"]*)['"]/g;
+  let m;
+  while ((m = re.exec(code))) imports.add(m[1]);
+  // Also match: import('pkg')
+  const dynRe = /import\(\s*['"]([^'"./][^'"]*)['"]\s*\)/g;
+  while ((m = dynRe.exec(code))) imports.add(m[1]);
+  return [...imports];
 }
 
-// ── Import classification ──────────────────────────────────────────────
-function isLocalImport(specifier: string): boolean {
-  if (specifier.startsWith('.')) return true;
-  if (specifier.startsWith('/') && !specifier.startsWith('/npm/')) return true;
-  if (/^[@~#]\//.test(specifier)) return true;
-  return false;
-}
-
+/** Check if an import is a framework/Node.js import that should be stubbed */
 function isFrameworkImport(specifier: string): boolean {
   const prefixes = [
     'next/', 'next-auth', 'nuxt/', '@nuxt/',
@@ -130,89 +107,38 @@ function isFrameworkImport(specifier: string): boolean {
   );
 }
 
-// ── esbuild plugin: resolve npm packages from jsdelivr CDN ─────────────
-const CDN_BASE = 'https://cdn.jsdelivr.net';
+/** Rewrite bare imports to esm.sh URLs, stub framework imports */
+function rewriteImports(code: string): { code: string; skipped: string[] } {
+  const skipped: string[] = [];
 
-function cdnPlugin(skipped: string[]): esbuild.Plugin {
-  const REACT_EXTERNALS: Record<string, string> = {
-    'react': 'react',
-    'react-dom': 'react-dom',
-    'react-dom/client': 'react-dom/client',
-    'react/jsx-runtime': 'react/jsx-runtime',
-    'react/jsx-dev-runtime': 'react/jsx-dev-runtime',
-  };
-
-  function getReactExternal(path: string): string | null {
-    if (REACT_EXTERNALS[path]) return REACT_EXTERNALS[path];
-    const cdnMatch = path.match(/^\/npm\/(react(?:-dom)?)((?:@[^/]+)?)(\/.*?)?\/?(?:\+esm)?$/);
-    if (cdnMatch) {
-      const pkg = cdnMatch[1];
-      const subpath = cdnMatch[3]?.replace(/\/\+esm$/, '') || '';
-      const key = subpath ? `${pkg}${subpath}` : pkg;
-      return REACT_EXTERNALS[key] || REACT_EXTERNALS[pkg] || null;
+  const result = code.replace(
+    /((?:import|export)\s+.*?from\s+)['"]([^'"]+)['"]/g,
+    (full, prefix, specifier) => {
+      // Leave relative/absolute imports alone
+      if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('http')) {
+        return full;
+      }
+      // Stub framework/Node imports
+      if (isFrameworkImport(specifier)) {
+        skipped.push(specifier);
+        return `${prefix}'data:text/javascript,export default null'`;
+      }
+      // Rewrite to esm.sh
+      return `${prefix}'https://esm.sh/${specifier}?external=react,react-dom'`;
     }
-    return null;
-  }
+  );
 
-  return {
-    name: 'cdn-resolve',
-    setup(build) {
-      build.onResolve({ filter: /.*/ }, (args) => {
-        const reactExternal = getReactExternal(args.path);
-        if (reactExternal) return { path: reactExternal, external: true };
-
-        if (args.namespace === 'cdn') {
-          if (args.path.startsWith('.') || args.path.startsWith('/')) {
-            const resolved = new URL(args.path, `${CDN_BASE}${args.importer}`).pathname;
-            const reactResolved = getReactExternal(resolved);
-            if (reactResolved) return { path: reactResolved, external: true };
-            return { path: resolved, namespace: 'cdn' };
-          }
-          if (!isLocalImport(args.path) && !isFrameworkImport(args.path)) {
-            return { path: `/npm/${args.path}/+esm`, namespace: 'cdn' };
-          }
-        }
-
-        if (args.namespace === 'entry') return undefined;
-
-        if (isLocalImport(args.path) || isFrameworkImport(args.path)) {
-          skipped.push(args.path);
-          return { path: args.path, namespace: 'stub' };
-        }
-
-        return { path: `/npm/${args.path}/+esm`, namespace: 'cdn' };
-      });
-
-      build.onLoad({ filter: /.*/, namespace: 'cdn' }, async (args) => {
-        const url = `${CDN_BASE}${args.path}`;
-        try {
-          const contents = await fetchText(url);
-          return { contents, loader: 'js' };
-        } catch (err) {
-          return { contents: `/* Failed to load: ${url} — ${(err as Error).message} */\nexport default {};`, loader: 'js' };
-        }
-      });
-
-      build.onLoad({ filter: /.*/, namespace: 'stub' }, () => ({
-        contents: `
-          const handler = { get(_, p) { if (p === '__esModule') return true; if (p === 'default') return (props) => props?.children ?? null; return () => null; } };
-          export default new Proxy({}, handler);
-          export const __esModule = true;
-        `,
-        loader: 'js',
-      }));
-    },
-  };
+  return { code: result, skipped };
 }
 
 // ── Main render pipeline ───────────────────────────────────────────────
 async function renderPreview(code: string, css?: string) {
   hideError();
-  showLoading('Initializing...');
+  showLoading('Loading compiler...');
 
   document.getElementById('preview-warnings')?.remove();
 
-  // Inject custom CSS if provided
+  // Inject custom CSS
   let customStyleEl = document.getElementById('preview-custom-css') as HTMLStyleElement | null;
   if (css) {
     if (!customStyleEl) {
@@ -230,68 +156,69 @@ async function renderPreview(code: string, css?: string) {
     await loadTailwindCDN();
   }
 
+  // Load Sucrase
   try {
-    await ensureEsbuild();
+    await ensureSucrase();
   } catch (err) {
-    showError(`Failed to initialize esbuild:\n${(err as Error).message}`);
+    showError(`Failed to load compiler:\n${(err as Error).message}`);
     return;
   }
 
-  showLoading('Bundling...');
+  showLoading('Compiling...');
 
-  const skipped: string[] = [];
-  let bundledCode: string;
-
+  // Compile JSX/TSX → JS
+  let compiled: string;
   try {
-    const result = await esbuild.build({
-      stdin: {
-        contents: code,
-        loader: 'tsx',
-        resolveDir: '/',
-      },
-      bundle: true,
-      format: 'cjs',
-      platform: 'browser',
-      jsx: 'automatic',
+    const result = sucraseTransform!(code, {
+      transforms: ['jsx', 'typescript', 'imports'],
+      jsxRuntime: 'automatic',
       jsxImportSource: 'react',
-      define: {
-        'process.env.NODE_ENV': '"production"',
-        'process.env': '{}',
-      },
-      plugins: [cdnPlugin(skipped)],
-      write: false,
-      logLevel: 'silent',
+      production: true,
     });
-
-    bundledCode = result.outputFiles[0].text;
+    compiled = result.code;
   } catch (err) {
-    showError(`Build error:\n${(err as Error).message}`);
+    showError(`Compile error:\n${(err as Error).message}`);
     return;
   }
 
-  showLoading('Rendering...');
-
-  const requireSync = (spec: string): any => {
-    if (EXTERNAL_MODULES[spec]) return EXTERNAL_MODULES[spec];
-    console.warn(`[preview] Unresolved require("${spec}")`);
-    return {};
-  };
-
-  const moduleExports: Record<string, any> = {};
-  const moduleObj = { exports: moduleExports };
-
+  // Sucrase with 'imports' transform outputs CJS (require/exports).
+  // We need ESM for blob URL import. Re-compile without 'imports' transform.
   try {
-    const fn = new Function('require', 'exports', 'module', bundledCode);
-    fn(requireSync, moduleExports, moduleObj);
+    const result = sucraseTransform!(code, {
+      transforms: ['jsx', 'typescript'],
+      jsxRuntime: 'automatic',
+      jsxImportSource: 'react',
+      production: true,
+    });
+    compiled = result.code;
+  } catch {
+    // Fall back to CJS version — will handle below
+  }
+
+  // Rewrite bare imports to esm.sh URLs
+  const { code: rewritten, skipped } = rewriteImports(compiled);
+
+  showLoading('Loading dependencies...');
+
+  // Create a blob URL module and import it
+  const blobContent = rewritten;
+  const blob = new Blob([blobContent], { type: 'text/javascript' });
+  const blobUrl = URL.createObjectURL(blob);
+
+  let mod: any;
+  try {
+    mod = await import(/* @vite-ignore */ blobUrl);
   } catch (err) {
+    URL.revokeObjectURL(blobUrl);
     showError(`Runtime error:\n${(err as Error).message}`);
     return;
   }
+  URL.revokeObjectURL(blobUrl);
 
-  const exported = moduleObj.exports;
+  // Find the component
   const Component =
-    exported?.default ||
-    Object.values(exported).find((v) => typeof v === 'function') ||
+    mod?.default ||
+    Object.values(mod).find((v: any) => typeof v === 'function') ||
     null;
 
   if (!Component || typeof Component !== 'function') {
@@ -303,16 +230,30 @@ async function renderPreview(code: string, css?: string) {
     return;
   }
 
+  // Render
+  showLoading('Rendering...');
+
   try {
+    // Dynamic import React from esm.sh so we use the same instance as the component
+    const React = await import('https://esm.sh/react@19?external=');
+    const ReactDOM = await import('https://esm.sh/react-dom@19/client?external=');
+
     hideLoading();
     rootEl.innerHTML = '';
 
-    if (currentRoot) currentRoot.unmount();
-    currentRoot = ReactDOM.createRoot(rootEl, {
-      onRecoverableError: (err) => showError(`React error:\n${(err as Error).message || err}`),
-    });
-    currentRoot.render(React.createElement(Component));
+    // Cleanup previous render
+    if (currentCleanup) {
+      currentCleanup();
+      currentCleanup = null;
+    }
 
+    const root = ReactDOM.createRoot(rootEl, {
+      onRecoverableError: (err: any) => showError(`React error:\n${err?.message || err}`),
+    });
+    root.render(React.createElement(Component));
+    currentCleanup = () => root.unmount();
+
+    // Nudge Tailwind
     if (tailwindLoaded) {
       requestAnimationFrame(() => {
         const probe = document.createElement('div');
@@ -322,18 +263,16 @@ async function renderPreview(code: string, css?: string) {
       });
     }
 
-    const warnings: string[] = [];
-    if (skipped.length > 0) warnings.push(`Skipped: ${skipped.join(', ')}`);
-    if (warnings.length > 0) {
+    // Show warnings
+    if (skipped.length > 0) {
       const el = document.createElement('div');
       el.id = 'preview-warnings';
       el.style.cssText =
         'position:fixed;bottom:0;left:0;right:0;padding:6px 12px;background:#fefce8;border-top:1px solid #fde68a;color:#92400e;font-size:11px;font-family:ui-monospace,monospace;z-index:100';
-      el.textContent = warnings.join(' | ');
+      el.textContent = `Skipped: ${skipped.join(', ')}`;
       document.body.appendChild(el);
     }
 
-    // Notify parent that render is complete
     notifyParent({ type: 'preview-ready' });
   } catch (err) {
     showError(`Render error:\n${(err as Error).message}`);
@@ -390,6 +329,4 @@ async function loadFromHash() {
 hideLoading();
 loadingEl.innerHTML = '<span style="color:#a1a1aa">Waiting for code...</span>';
 notifyParent({ type: 'preview-loaded' });
-
-// Check if there's code in the URL hash
 loadFromHash();
