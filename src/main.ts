@@ -4,8 +4,15 @@
  * Receives JSX code via postMessage or URL hash, compiles it with Sucrase
  * (loaded from CDN), resolves npm imports via esm.sh, and renders the component.
  *
- * No bundler needed — uses native ES module imports via blob URLs.
+ * React is loaded once via import map (in index.html) so the component and
+ * renderer always share the same React instance. Third-party packages are
+ * rewritten to esm.sh with ?external=react,react-dom so they also use the
+ * import map's React.
  */
+
+// These resolve via the import map in index.html → single React instance
+import React from 'react';
+import ReactDOM from 'react-dom/client';
 
 const rootEl = document.getElementById('root')!;
 const errorEl = document.getElementById('error')!;
@@ -23,7 +30,7 @@ async function ensureSucrase(): Promise<void> {
   if (sucraseLoading) return sucraseLoading;
 
   sucraseLoading = (async () => {
-    const mod = await import('https://esm.sh/sucrase@3.35.1');
+    const mod = await import(/* @vite-ignore */ 'https://esm.sh/sucrase@3.35.1?external=react,react-dom');
     sucraseTransform = mod.transform;
     console.log('[preview] Sucrase loaded');
   })();
@@ -80,18 +87,10 @@ function hideLoading() { loadingEl.style.display = 'none'; }
 
 // ── Import rewriting ───────────────────────────────────────────────────
 
-/** Extract bare import specifiers from code */
-function extractImports(code: string): string[] {
-  const imports = new Set<string>();
-  // Match: import ... from 'pkg' / import 'pkg' / export ... from 'pkg'
-  const re = /(?:import|export)\s+.*?from\s+['"]([^'"./][^'"]*)['"]/g;
-  let m;
-  while ((m = re.exec(code))) imports.add(m[1]);
-  // Also match: import('pkg')
-  const dynRe = /import\(\s*['"]([^'"./][^'"]*)['"]\s*\)/g;
-  while ((m = dynRe.exec(code))) imports.add(m[1]);
-  return [...imports];
-}
+const REACT_PACKAGES = new Set([
+  'react', 'react-dom', 'react-dom/client',
+  'react/jsx-runtime', 'react/jsx-dev-runtime',
+]);
 
 /** Check if an import is a framework/Node.js import that should be stubbed */
 function isFrameworkImport(specifier: string): boolean {
@@ -107,15 +106,24 @@ function isFrameworkImport(specifier: string): boolean {
   );
 }
 
-/** Rewrite bare imports to esm.sh URLs, stub framework imports */
+/**
+ * Rewrite bare imports:
+ * - react/react-dom → left as bare (resolved by import map)
+ * - framework/Node → stubbed
+ * - everything else → esm.sh with ?external=react,react-dom
+ */
 function rewriteImports(code: string): { code: string; skipped: string[] } {
   const skipped: string[] = [];
 
   const result = code.replace(
     /((?:import|export)\s+.*?from\s+)['"]([^'"]+)['"]/g,
     (full, prefix, specifier) => {
-      // Leave relative/absolute imports alone
+      // Leave relative/absolute/http imports alone
       if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('http')) {
+        return full;
+      }
+      // React packages — keep bare, import map handles them
+      if (REACT_PACKAGES.has(specifier)) {
         return full;
       }
       // Stub framework/Node imports
@@ -123,7 +131,7 @@ function rewriteImports(code: string): { code: string; skipped: string[] } {
         skipped.push(specifier);
         return `${prefix}'data:text/javascript,export default null'`;
       }
-      // Rewrite to esm.sh
+      // npm package → esm.sh (with external react so it uses the import map's React)
       return `${prefix}'https://esm.sh/${specifier}?external=react,react-dom'`;
     }
   );
@@ -166,11 +174,11 @@ async function renderPreview(code: string, css?: string) {
 
   showLoading('Compiling...');
 
-  // Compile JSX/TSX → JS
+  // Compile JSX/TSX → ESM JS (no imports transform — keep ES imports)
   let compiled: string;
   try {
     const result = sucraseTransform!(code, {
-      transforms: ['jsx', 'typescript', 'imports'],
+      transforms: ['jsx', 'typescript'],
       jsxRuntime: 'automatic',
       jsxImportSource: 'react',
       production: true,
@@ -181,28 +189,14 @@ async function renderPreview(code: string, css?: string) {
     return;
   }
 
-  // Sucrase with 'imports' transform outputs CJS (require/exports).
-  // We need ESM for blob URL import. Re-compile without 'imports' transform.
-  try {
-    const result = sucraseTransform!(code, {
-      transforms: ['jsx', 'typescript'],
-      jsxRuntime: 'automatic',
-      jsxImportSource: 'react',
-      production: true,
-    });
-    compiled = result.code;
-  } catch {
-    // Fall back to CJS version — will handle below
-  }
-
-  // Rewrite bare imports to esm.sh URLs
+  // Rewrite non-react bare imports to esm.sh URLs
   const { code: rewritten, skipped } = rewriteImports(compiled);
 
   showLoading('Loading dependencies...');
 
-  // Create a blob URL module and import it
-  const blobContent = rewritten;
-  const blob = new Blob([blobContent], { type: 'text/javascript' });
+  // Create a blob URL module and dynamic-import it
+  // Blob URLs inherit the page's import map, so bare `react` imports resolve correctly
+  const blob = new Blob([rewritten], { type: 'text/javascript' });
   const blobUrl = URL.createObjectURL(blob);
 
   let mod: any;
@@ -230,18 +224,13 @@ async function renderPreview(code: string, css?: string) {
     return;
   }
 
-  // Render
+  // Render using the same React from import map
   showLoading('Rendering...');
 
   try {
-    // Dynamic import React from esm.sh so we use the same instance as the component
-    const React = await import('https://esm.sh/react@19?external=');
-    const ReactDOM = await import('https://esm.sh/react-dom@19/client?external=');
-
     hideLoading();
     rootEl.innerHTML = '';
 
-    // Cleanup previous render
     if (currentCleanup) {
       currentCleanup();
       currentCleanup = null;
