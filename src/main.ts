@@ -18,8 +18,6 @@ const rootEl = document.getElementById('root')!;
 const errorEl = document.getElementById('error')!;
 const loadingEl = document.getElementById('loading')!;
 
-let tailwindLoaded = false;
-let pendingTailwind: Promise<void> | null = null;
 let sucraseTransform: ((code: string, options: any) => { code: string }) | null = null;
 let sucraseLoading: Promise<void> | null = null;
 let currentCleanup: (() => void) | null = null;
@@ -36,25 +34,6 @@ async function ensureSucrase(): Promise<void> {
   })();
 
   return sucraseLoading;
-}
-
-// ── Tailwind CDN ───────────────────────────────────────────────────────
-function loadTailwindCDN(): Promise<void> {
-  if (tailwindLoaded) return Promise.resolve();
-  if (pendingTailwind) return pendingTailwind;
-
-  pendingTailwind = new Promise((resolve) => {
-    const script = document.createElement('script');
-    script.src = 'https://cdn.tailwindcss.com';
-    script.onload = () => { tailwindLoaded = true; pendingTailwind = null; resolve(); };
-    script.onerror = () => { console.warn('[preview] Failed to load Tailwind CDN'); pendingTailwind = null; resolve(); };
-    document.head.appendChild(script);
-  });
-  return pendingTailwind;
-}
-
-function codeUsesTailwind(code: string): boolean {
-  return /class(?:Name)?=["'`{][^"'`}]*(?:flex|grid|p-\d|m-\d|px-|py-|mx-|my-|w-\[|h-\[|text-(?:sm|lg|xl|\[)|bg-(?:\w|linear)|border|rounded|gap-|space-[xy]|items-|justify-|overflow-|translate|scale-|rotate-|transition|animate-|shadow|ring-|inset-|leading-|tracking-|font-(?:bold|medium|semibold|light)|whitespace-|pointer-events-)/.test(code);
 }
 
 // ── UI helpers ─────────────────────────────────────────────────────────
@@ -116,7 +95,7 @@ function rewriteImports(code: string): { code: string; skipped: string[] } {
   const skipped: string[] = [];
 
   const result = code.replace(
-    /((?:import|export)\s+.*?from\s+)['"]([^'"]+)['"]/g,
+    /((?:import|export)\s+.*?from\s+)['"]([^'"]+)['"]/gs,
     (full, prefix, specifier) => {
       // Leave relative/absolute/http imports alone
       if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('http')) {
@@ -157,11 +136,6 @@ async function renderPreview(code: string, css?: string) {
     customStyleEl.textContent = css;
   } else if (customStyleEl) {
     customStyleEl.textContent = '';
-  }
-
-  // Auto-detect Tailwind
-  if (!tailwindLoaded && codeUsesTailwind(code)) {
-    await loadTailwindCDN();
   }
 
   // Load Sucrase
@@ -242,16 +216,6 @@ async function renderPreview(code: string, css?: string) {
     root.render(React.createElement(Component));
     currentCleanup = () => root.unmount();
 
-    // Nudge Tailwind
-    if (tailwindLoaded) {
-      requestAnimationFrame(() => {
-        const probe = document.createElement('div');
-        probe.className = 'hidden';
-        rootEl.appendChild(probe);
-        requestAnimationFrame(() => probe.remove());
-      });
-    }
-
     // Show warnings
     if (skipped.length > 0) {
       const el = document.createElement('div');
@@ -287,13 +251,7 @@ window.addEventListener('unhandledrejection', (e) => {
 window.addEventListener('message', async (event) => {
   const data = event.data || {};
 
-  if (data.type === 'preview-tailwind') {
-    await loadTailwindCDN();
-  }
-
   if (data.type === 'preview-render') {
-    if (data.tailwind) await loadTailwindCDN();
-    if (pendingTailwind) await pendingTailwind;
     await renderPreview(data.code, data.css);
   }
 });
@@ -306,7 +264,6 @@ async function loadFromHash() {
   try {
     const json = JSON.parse(atob(hash));
     if (json.code) {
-      if (json.tailwind) await loadTailwindCDN();
       await renderPreview(json.code, json.css);
     }
   } catch {
