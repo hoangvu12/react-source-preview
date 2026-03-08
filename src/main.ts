@@ -21,6 +21,8 @@ const loadingEl = document.getElementById('loading')!;
 let sucraseTransform: ((code: string, options: any) => { code: string }) | null = null;
 let sucraseLoading: Promise<void> | null = null;
 let currentCleanup: (() => void) | null = null;
+let isComponentReady = false;
+let pendingCaptures: (() => void)[] = [];
 
 // ── Load Sucrase from CDN ──────────────────────────────────────────────
 async function ensureSucrase(): Promise<void> {
@@ -120,6 +122,7 @@ function rewriteImports(code: string): { code: string; skipped: string[] } {
 
 // ── Main render pipeline ───────────────────────────────────────────────
 async function renderPreview(code: string, css?: string) {
+  isComponentReady = false;
   hideError();
   showLoading('Loading compiler...');
 
@@ -226,6 +229,9 @@ async function renderPreview(code: string, css?: string) {
       document.body.appendChild(el);
     }
 
+    isComponentReady = true;
+    pendingCaptures.forEach(fn => fn());
+    pendingCaptures = [];
     notifyParent({ type: 'preview-ready' });
   } catch (err) {
     showError(`Render error:\n${(err as Error).message}`);
@@ -257,12 +263,36 @@ window.addEventListener('message', async (event) => {
 
   if (data.type === 'capture-screenshot') {
     try {
+      // Wait for component to finish rendering
+      if (!isComponentReady) {
+        await new Promise<void>(resolve => pendingCaptures.push(resolve));
+      }
+
       const { toJpeg } = await import(/* @vite-ignore */ 'https://esm.sh/html-to-image@1.11.13');
-      const dataUrl = await toJpeg(rootEl, {
-        quality: 0.8,
-        backgroundColor: getComputedStyle(document.body).backgroundColor || '#ffffff',
-      });
+
+      // Temporarily expand to desktop width for a realistic screenshot
+      const width = data.width || 1280;
+      const savedHtml = document.documentElement.style.cssText;
+      const savedBody = document.body.style.cssText;
+      const savedRoot = rootEl.style.cssText;
+
+      document.documentElement.style.width = `${width}px`;
+      document.body.style.width = `${width}px`;
+      rootEl.style.width = `${width}px`;
+      rootEl.style.minWidth = `${width}px`;
+
+      // Wait for reflow so layout recalculates at new width
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+      const bg = getComputedStyle(document.body).backgroundColor || '#ffffff';
+      const dataUrl = await toJpeg(rootEl, { quality: 0.8, backgroundColor: bg });
       const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '');
+
+      // Restore original styles
+      document.documentElement.style.cssText = savedHtml;
+      document.body.style.cssText = savedBody;
+      rootEl.style.cssText = savedRoot;
+
       notifyParent({ type: 'screenshot-result', data: base64 });
     } catch (err) {
       notifyParent({ type: 'screenshot-result', error: (err as Error).message });
