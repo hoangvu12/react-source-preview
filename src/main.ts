@@ -254,6 +254,20 @@ window.addEventListener('message', async (event) => {
   if (data.type === 'preview-render') {
     await renderPreview(data.code, data.css);
   }
+
+  if (data.type === 'capture-screenshot') {
+    try {
+      const { toJpeg } = await import(/* @vite-ignore */ 'https://esm.sh/html-to-image@1.11.13');
+      const dataUrl = await toJpeg(rootEl, {
+        quality: 0.8,
+        backgroundColor: getComputedStyle(document.body).backgroundColor || '#ffffff',
+      });
+      const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '');
+      notifyParent({ type: 'screenshot-result', data: base64 });
+    } catch (err) {
+      notifyParent({ type: 'screenshot-result', error: (err as Error).message });
+    }
+  }
 });
 
 // ── URL hash fallback ──────────────────────────────────────────────────
