@@ -44,24 +44,19 @@ function buildSandpackFiles(
   }
 
   // Sandpack's react-ts template has "main": "/App.tsx" in its package.json,
-  // which means the bundler uses App.tsx as the entry — skipping index.tsx entirely.
-  // We override package.json to point main at /index.tsx so the bootstrap code runs.
-  const entryKey = entryFile.startsWith('/') ? entryFile : `/${entryFile}`;
-  const importPath = entryKey.replace(/\.(tsx?|jsx?)$/, '');
-
-  result['/index.tsx'] = [
-    `import React, { StrictMode } from "react";`,
-    `import { createRoot } from "react-dom/client";`,
-    `import App from "${importPath}";`,
-    ``,
-    `const root = createRoot(document.getElementById("root")!);`,
-    `root.render(<StrictMode><App /></StrictMode>);`,
-  ].join('\n');
-
+  // skipping the template's /index.tsx bootstrap (createRoot/render).
+  // Override to point main at /index.tsx so the bootstrap code runs.
   result['/package.json'] = JSON.stringify({
     main: '/index.tsx',
     dependencies: { react: '^19.0.0', 'react-dom': '^19.0.0' },
   });
+
+  // Ensure /App.tsx exists — the template's /index.tsx imports from ./App
+  const entryKey = entryFile.startsWith('/') ? entryFile : `/${entryFile}`;
+  if (entryKey !== '/App.tsx') {
+    const cleanPath = `.${entryKey}`.replace(/\.(tsx?|jsx?)$/, '');
+    result['/App.tsx'] = `export { default } from '${cleanPath}';\n`;
+  }
 
   return result;
 }
