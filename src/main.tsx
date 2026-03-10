@@ -43,16 +43,25 @@ function buildSandpackFiles(
     }
   }
 
-  // Sandpack's react-ts template boots from /App.tsx (imported by its built-in /index.tsx).
-  // If the user's entry file isn't App.tsx, create a wrapper that re-exports it.
+  // Sandpack's react-ts template has "main": "/App.tsx" in its package.json,
+  // which means the bundler uses App.tsx as the entry — skipping index.tsx entirely.
+  // We override package.json to point main at /index.tsx so the bootstrap code runs.
   const entryKey = entryFile.startsWith('/') ? entryFile : `/${entryFile}`;
-  if (entryKey !== '/App.tsx') {
-    // Make the import path relative from root
-    const importPath = entryKey.startsWith('/') ? `.${entryKey}` : `./${entryKey}`;
-    // Strip extension for cleaner import
-    const cleanPath = importPath.replace(/\.(tsx?|jsx?)$/, '');
-    result['/App.tsx'] = `export { default } from '${cleanPath}';\n`;
-  }
+  const importPath = entryKey.replace(/\.(tsx?|jsx?)$/, '');
+
+  result['/index.tsx'] = [
+    `import React, { StrictMode } from "react";`,
+    `import { createRoot } from "react-dom/client";`,
+    `import App from "${importPath}";`,
+    ``,
+    `const root = createRoot(document.getElementById("root")!);`,
+    `root.render(<StrictMode><App /></StrictMode>);`,
+  ].join('\n');
+
+  result['/package.json'] = JSON.stringify({
+    main: '/index.tsx',
+    dependencies: { react: '^19.0.0', 'react-dom': '^19.0.0' },
+  });
 
   return result;
 }
