@@ -43,6 +43,17 @@ function buildSandpackFiles(
     }
   }
 
+  // Sandpack's react-ts template boots from /App.tsx (imported by its built-in /index.tsx).
+  // If the user's entry file isn't App.tsx, create a wrapper that re-exports it.
+  const entryKey = entryFile.startsWith('/') ? entryFile : `/${entryFile}`;
+  if (entryKey !== '/App.tsx') {
+    // Make the import path relative from root
+    const importPath = entryKey.startsWith('/') ? `.${entryKey}` : `./${entryKey}`;
+    // Strip extension for cleaner import
+    const cleanPath = importPath.replace(/\.(tsx?|jsx?)$/, '');
+    result['/App.tsx'] = `export { default } from '${cleanPath}';\n`;
+  }
+
   return result;
 }
 
@@ -127,15 +138,10 @@ function App() {
     previewData.injectedCSS,
   );
 
-  const entryKey = previewData.entryFile.startsWith('/')
-    ? previewData.entryFile
-    : `/${previewData.entryFile}`;
-
   return (
     <SandpackProvider
       template="react-ts"
       files={sandpackFiles}
-      customSetup={{ entry: entryKey }}
       options={{ autorun: true }}
     >
       <SandpackPreview
