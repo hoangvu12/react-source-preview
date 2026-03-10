@@ -43,12 +43,27 @@ function buildSandpackFiles(
     }
   }
 
-  // Sandpack's react-ts template has "main": "/App.tsx" in its package.json,
-  // skipping the template's /index.tsx bootstrap (createRoot/render).
-  // Override to point main at /index.tsx so the bootstrap code runs.
+  // Scan all files for bare npm imports and auto-add as dependencies
+  const deps: Record<string, string> = { react: 'latest', 'react-dom': 'latest' };
+  const importRe = /(?:import|export)\s.*?from\s+['"]([^'"]+)['"]/g;
+  for (const content of Object.values(result)) {
+    let m: RegExpExecArray | null;
+    while ((m = importRe.exec(content)) !== null) {
+      const spec = m[1];
+      // Skip relative, absolute, and http imports
+      if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('http')) continue;
+      // Get package name (handle scoped packages like @foo/bar)
+      const pkgName = spec.startsWith('@')
+        ? spec.split('/').slice(0, 2).join('/')
+        : spec.split('/')[0];
+      if (!deps[pkgName]) deps[pkgName] = 'latest';
+    }
+  }
+
+  // Override template's package.json — fix main to /index.tsx and include detected deps
   result['/package.json'] = JSON.stringify({
     main: '/index.tsx',
-    dependencies: { react: '^19.0.0', 'react-dom': '^19.0.0' },
+    dependencies: deps,
   });
 
   // Ensure /App.tsx exists — the template's /index.tsx imports from ./App
