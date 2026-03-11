@@ -45,7 +45,7 @@ function buildSandpackFiles(
 
   // Scan all files for bare npm imports and auto-add as dependencies
   const deps: Record<string, string> = { react: 'latest', 'react-dom': 'latest' };
-  const importRe = /(?:import|export)\s.*?from\s+['"]([^'"]+)['"]/g;
+  const importRe = /(?:import|export)\s[\s\S]*?from\s+['"]([^'"]+)['"]/g;
   for (const content of Object.values(result)) {
     let m: RegExpExecArray | null;
     while ((m = importRe.exec(content)) !== null) {
