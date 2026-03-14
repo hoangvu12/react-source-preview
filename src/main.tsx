@@ -21,11 +21,11 @@ interface PreviewMessage {
   injectedCSS?: string;
 }
 
-function buildSandpackFiles(
+async function buildSandpackFiles(
   files: Record<string, string>,
   entryFile: string,
   injectedCSS?: string,
-): Record<string, string> {
+): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
 
   for (const [path, content] of Object.entries(files)) {
@@ -45,22 +45,48 @@ function buildSandpackFiles(
 
   // Scan all files for bare npm imports and auto-add as dependencies
   const deps: Record<string, string> = { react: 'latest', 'react-dom': 'latest' };
-  // Match: import/export ... from 'pkg', and side-effect import 'pkg'
+  // Match: import/export ... from 'pkg', side-effect import 'pkg', and require('pkg')
   const fromImportRe = /(?:import|export)\s[\s\S]*?from\s+['"]([^'"]+)['"]/g;
   const sideEffectRe = /import\s+['"]([^'"]+)['"]/g;
+  const requireRe = /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
   for (const content of Object.values(result)) {
     let m: RegExpExecArray | null;
-    for (const re of [fromImportRe, sideEffectRe]) {
+    for (const re of [fromImportRe, sideEffectRe, requireRe]) {
       re.lastIndex = 0;
       while ((m = re.exec(content)) !== null) {
         const spec = m[1];
-        // Skip relative, absolute, and http imports
-        if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('http')) continue;
+        // Skip relative, absolute, http imports, and numeric webpack module IDs
+        if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('http') || /^\d+$/.test(spec)) continue;
         // Get package name (handle scoped packages like @foo/bar)
         const pkgName = spec.startsWith('@')
           ? spec.split('/').slice(0, 2).join('/')
           : spec.split('/')[0];
         if (!deps[pkgName]) deps[pkgName] = 'latest';
+      }
+    }
+  }
+
+
+  // Resolve peer dependencies from unpkg — packages like @react-three/fiber need 'three'
+  const pkgsToCheck = Object.keys(deps).filter(p => p !== 'react' && p !== 'react-dom');
+  if (pkgsToCheck.length > 0) {
+    const peerResults = await Promise.allSettled(
+      pkgsToCheck.map(async (pkg) => {
+        try {
+          const res = await fetch(`https://unpkg.com/${pkg}/package.json`, { redirect: 'follow' });
+          if (!res.ok) return null;
+          const data = await res.json();
+          return data.peerDependencies as Record<string, string> | undefined;
+        } catch { return null; }
+      })
+    );
+    for (const result2 of peerResults) {
+      if (result2.status === 'fulfilled' && result2.value) {
+        for (const peer of Object.keys(result2.value)) {
+          // Skip react/react-dom (already included), expo/react-native (not relevant for web)
+          if (deps[peer] || /^(react|react-dom|react-native|expo)/.test(peer)) continue;
+          deps[peer] = 'latest';
+        }
       }
     }
   }
@@ -139,10 +165,10 @@ function SandpackBridge() {
 
   // Listen for incremental file updates during streaming
   useEffect(() => {
-    const handler = (event: MessageEvent) => {
+    const handler = async (event: MessageEvent) => {
       const data = event.data || {};
       if (data.type === 'preview-update' && data.files) {
-        const newFiles = buildSandpackFiles(data.files, data.entryFile, data.injectedCSS);
+        const newFiles = await buildSandpackFiles(data.files, data.entryFile, data.injectedCSS);
         for (const [path, content] of Object.entries(newFiles)) {
           sandpack.updateFile(path, content);
         }
@@ -157,6 +183,7 @@ function SandpackBridge() {
 
 function App() {
   const [previewData, setPreviewData] = useState<PreviewMessage | null>(null);
+  const [sandpackFiles, setSandpackFiles] = useState<Record<string, string> | null>(null);
 
   useEffect(() => {
     const handler = (event: MessageEvent) => {
@@ -176,12 +203,21 @@ function App() {
     return () => window.removeEventListener('message', handler);
   }, []);
 
+  // Resolve sandpack files (async — fetches peer deps from unpkg)
+  useEffect(() => {
+    if (!previewData) return;
+    let cancelled = false;
+    buildSandpackFiles(previewData.files, previewData.entryFile, previewData.injectedCSS)
+      .then(files => { if (!cancelled) setSandpackFiles(files); });
+    return () => { cancelled = true; };
+  }, [previewData]);
+
   // Signal ready on mount
   useEffect(() => {
     notifyParent({ type: 'preview-loaded' });
   }, []);
 
-  if (!previewData) {
+  if (!previewData || !sandpackFiles) {
     return (
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -192,12 +228,6 @@ function App() {
       </div>
     );
   }
-
-  const sandpackFiles = buildSandpackFiles(
-    previewData.files,
-    previewData.entryFile,
-    previewData.injectedCSS,
-  );
 
   return (
     <SandpackProvider
