@@ -45,18 +45,23 @@ function buildSandpackFiles(
 
   // Scan all files for bare npm imports and auto-add as dependencies
   const deps: Record<string, string> = { react: 'latest', 'react-dom': 'latest' };
-  const importRe = /(?:import|export)\s.*?from\s+['"]([^'"]+)['"]/g;
+  // Match: import/export ... from 'pkg', and side-effect import 'pkg'
+  const fromImportRe = /(?:import|export)\s[\s\S]*?from\s+['"]([^'"]+)['"]/g;
+  const sideEffectRe = /import\s+['"]([^'"]+)['"]/g;
   for (const content of Object.values(result)) {
     let m: RegExpExecArray | null;
-    while ((m = importRe.exec(content)) !== null) {
-      const spec = m[1];
-      // Skip relative, absolute, and http imports
-      if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('http')) continue;
-      // Get package name (handle scoped packages like @foo/bar)
-      const pkgName = spec.startsWith('@')
-        ? spec.split('/').slice(0, 2).join('/')
-        : spec.split('/')[0];
-      if (!deps[pkgName]) deps[pkgName] = 'latest';
+    for (const re of [fromImportRe, sideEffectRe]) {
+      re.lastIndex = 0;
+      while ((m = re.exec(content)) !== null) {
+        const spec = m[1];
+        // Skip relative, absolute, and http imports
+        if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('http')) continue;
+        // Get package name (handle scoped packages like @foo/bar)
+        const pkgName = spec.startsWith('@')
+          ? spec.split('/').slice(0, 2).join('/')
+          : spec.split('/')[0];
+        if (!deps[pkgName]) deps[pkgName] = 'latest';
+      }
     }
   }
 
