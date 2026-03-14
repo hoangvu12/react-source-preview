@@ -45,7 +45,7 @@ function buildSandpackFiles(
 
   // Scan all files for bare npm imports and auto-add as dependencies
   const deps: Record<string, string> = { react: 'latest', 'react-dom': 'latest' };
-  const importRe = /(?:import|export)\s[\s\S]*?from\s+['"]([^'"]+)['"]/g;
+  const importRe = /(?:import|export)\s.*?from\s+['"]([^'"]+)['"]/g;
   for (const content of Object.values(result)) {
     let m: RegExpExecArray | null;
     while ((m = importRe.exec(content)) !== null) {
@@ -82,9 +82,9 @@ function notifyParent(data: any) {
   }
 }
 
-/** Watches Sandpack status and sends preview-ready when running. Also handles streaming updates. */
+/** Watches Sandpack status, forwards errors to parent, and handles streaming updates. */
 function SandpackBridge() {
-  const { sandpack } = useSandpack();
+  const { sandpack, listen } = useSandpack();
   const readyFired = useRef(false);
 
   // Notify parent when Sandpack starts running
@@ -94,6 +94,43 @@ function SandpackBridge() {
       notifyParent({ type: 'preview-ready' });
     }
   }, [sandpack.status]);
+
+  // Listen for errors and console.error from Sandpack bundler, forward to parent
+  useEffect(() => {
+    const unsubscribe = listen((msg: any) => {
+      // Compile/runtime errors (error overlay)
+      if (msg.type === 'action' && msg.action === 'show-error') {
+        notifyParent({
+          type: 'preview-error',
+          error: {
+            message: msg.message || msg.title || 'Unknown error',
+            title: msg.title,
+            path: msg.path,
+            line: msg.line,
+            column: msg.column,
+          },
+        });
+      }
+      // Console errors
+      if (msg.type === 'console' && Array.isArray(msg.log)) {
+        const errors = msg.log.filter((entry: any) => entry.method === 'error');
+        for (const err of errors) {
+          const message = Array.isArray(err.data)
+            ? err.data.map((d: any) => typeof d === 'string' ? d : JSON.stringify(d)).join(' ')
+            : String(err.data);
+          notifyParent({
+            type: 'preview-error',
+            error: { message, title: 'Console Error' },
+          });
+        }
+      }
+      // Compilation success — clear errors
+      if (msg.type === 'done' && !msg.compilatonError) {
+        notifyParent({ type: 'preview-error-clear' });
+      }
+    });
+    return unsubscribe;
+  }, [listen]);
 
   // Listen for incremental file updates during streaming
   useEffect(() => {
